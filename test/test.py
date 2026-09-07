@@ -6,7 +6,7 @@
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, FallingEdge, ReadOnly, NextTimeStep, Timer
+from cocotb.triggers import ClockCycles, RisingEdge, Timer
 
 IV64 = 0x00001000808C0001
 LAP_GO, PERM_AFTER, PERM_12 = 1 << 5, 1 << 6, 1 << 7
@@ -25,36 +25,46 @@ KATS = [
 le64 = lambda b: int.from_bytes(b, "little")
 
 
-async def wait_ready(dut, limit=4000):
-    """Settle mid-cycle (falling edge) and return in a writable phase with
-    READY high; writes made now are seen by the next rising edge."""
-    for _ in range(limit):
-        await FallingEdge(dut.clk)
-        await ReadOnly()
-        ready = (int(dut.uio_out.value) >> 7) & 1
-        await Timer(1, units="ns")   # into the cycle interior: writable, before the next rising edge
-        if ready:
-            return
-    raise AssertionError("timeout waiting for READY")
+def get_bit(sig, n):
+    """X-tolerant single-bit read: returns True only for a resolved '1'.
+    (int() on a whole bus raises if any unrelated bit is X, e.g. COL_OUT
+    before the first state load in gate-level sim.)"""
+    bs = sig.value.binstr
+    return bs[len(bs) - 1 - n] == "1"
 
 
-async def lap(dut, planes, xor_mode, perm_after, perm12, capture=False):
-    """planes = (c0..c4) 64-bit column planes; returns 64 captured columns."""
-    await wait_ready(dut)
+async def lap(dut, planes, xor_mode, perm_after, perm12, capture=False, limit=4000):
+    """Run one 64-cycle lap. GL-timing-safe: inputs are driven ~3ns after each
+    rising edge (leaving nearly a full period for #1-delay gates before the
+    capturing edge); outputs are sampled ~15ns into the cycle, after gate
+    delays settle. planes = (c0..c4) 64-bit column planes; returns captured
+    columns when capture=True."""
     dut.uio_in.value = 1 if xor_mode else 0
     dut.ui_in.value = LAP_GO | (PERM_AFTER if perm_after else 0) | (PERM_12 if perm12 else 0)
+    # request phase: hold LAP_GO until the lap self-aligns and starts
+    for _ in range(limit):
+        await RisingEdge(dut.clk)
+        await Timer(3, units="ns")
+        if get_bit(dut.uo_out, 5):             # LAP_ACTIVE (FF-driven, settled)
+            break
+    else:
+        raise AssertionError("timeout waiting for lap to start")
     cap = []
     for k in range(64):
-        await FallingEdge(dut.clk)      # lap cycle k, mid-cycle
         col = 0
         for w in range(5):
             col |= ((planes[w] >> k) & 1) << w
-        dut.ui_in.value = col           # GO dropped from cycle 0 on
-        await ReadOnly()                # comb settled with this column
-        assert (int(dut.uo_out.value) >> 5) & 1, "LAP_ACTIVE dropped mid-lap"
+        dut.ui_in.value = col                  # LAP_GO dropped from cycle 0 on
         if capture:
+            await Timer(12, units="ns")        # ~15ns into the cycle: comb settled
             cap.append(int(dut.uo_out.value) & 0x1F)
-        await NextTimeStep()
+        if k < 63:
+            await RisingEdge(dut.clk)
+            await Timer(3, units="ns")
+            assert get_bit(dut.uo_out, 5), "LAP_ACTIVE dropped mid-lap"
+    await RisingEdge(dut.clk)                  # edge that clocks column 63
+    await Timer(3, units="ns")
+    dut.ui_in.value = 0
     return cap
 
 
