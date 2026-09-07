@@ -11,3 +11,6 @@ test/sim_build
 test/__pycache__/
 test/results.xml
 test/gate_level_netlist.v
+sv2v-Linux/
+sv2v-Linux.zip
+obj_dir/
