@@ -1,9 +1,9 @@
 # Tiny Tapeout project information
 project:
-  title:        "Ascon-AEAD128 bit-serial core"      # Project title            
+  title:        "Ascon bit-serial permutation engine"      # Project title            
   author:       "Pranav Ullas"      # Your name           
   discord:      "giraffe8149"      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "Bit-serial Ascon-AEAD128 authenticated encryption core"      # One line description of what your project does 
+  description:  "Bit-serial Ascon permutation with streaming column-XOR interface; full AEAD-128 in the test suite"      # One line description of what your project does 
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     50000000       # Clock frequency in Hz (or 0 if not applicable)
 
@@ -18,7 +18,6 @@ project:
   # Don't forget to also update `PROJECT_SOURCES` in test/Makefile.
   source_files:
     - "project.v"
-    - "ascon_core_serial.v"
     - "ascon_permutation_serial.v"
     - "ascon_sbox.v"
 
@@ -26,34 +25,34 @@ project:
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
   # Inputs
-  ui[0]: "DATA_IN[0] (DECRYPT at START, TYPE_AD at BLOCK_GO)"
-  ui[1]: "DATA_IN[1] (LAST at BLOCK_GO)"
-  ui[2]: "DATA_IN[2]"
-  ui[3]: "DATA_IN[3]"
-  ui[4]: "DATA_IN[4]"
-  ui[5]: "DATA_IN[5]"
-  ui[6]: "DATA_IN[6]"
-  ui[7]: "DATA_IN[7]"
+  ui[0]: "COL_IN[0]"
+  ui[1]: "COL_IN[1]"
+  ui[2]: "COL_IN[2]"
+  ui[3]: "COL_IN[3]"
+  ui[4]: "COL_IN[4]"
+  ui[5]: "LAP_GO"
+  ui[6]: "PERM_AFTER"
+  ui[7]: "PERM_12"
 
   # Outputs
-  uo[0]: "DATA_OUT[0]"
-  uo[1]: "DATA_OUT[1]"
-  uo[2]: "DATA_OUT[2]"
-  uo[3]: "DATA_OUT[3]"
-  uo[4]: "DATA_OUT[4]"
-  uo[5]: "DATA_OUT[5]"
-  uo[6]: "DATA_OUT[6]"
-  uo[7]: "DATA_OUT[7]"
+  uo[0]: "COL_OUT[0]"
+  uo[1]: "COL_OUT[1]"
+  uo[2]: "COL_OUT[2]"
+  uo[3]: "COL_OUT[3]"
+  uo[4]: "COL_OUT[4]"
+  uo[5]: "LAP_ACTIVE"
+  uo[6]: "PERM_BUSY"
+  uo[7]: "PERM_DONE"
 
   # Bidirectional pins
-  uio[0]: "CMD[0]"
-  uio[1]: "CMD[1]"
-  uio[2]: "STROBE"
-  uio[3]: "START"
-  uio[4]: "BLOCK_GO"
-  uio[5]: "IN_READY"
-  uio[6]: "BUSY"
-  uio[7]: "OUT_VALID"
+  uio[0]: "LAP_XOR"
+  uio[1]: ""
+  uio[2]: ""
+  uio[3]: ""
+  uio[4]: ""
+  uio[5]: ""
+  uio[6]: ""
+  uio[7]: "READY"
 
 # Do not change!
 yaml_version: 6

@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# cocotb test for tt_um_pranavUl_ascon_aead128: drives the byte-wide host
-# protocol and checks ciphertext + tag against Ascon-AEAD128 known answers
-# (expected values generated offline with pyascon, NIST SP 800-232 variant).
+# cocotb test: full Ascon-AEAD128 known-answer tests driven through the
+# streaming lap interface. The host (this test) performs padding, block
+# sequencing and key/nonce column scheduling; the chip performs all state
+# processing. Expected values generated offline with pyascon (SP 800-232).
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles
+from cocotb.triggers import ClockCycles, FallingEdge, ReadOnly, NextTimeStep, Timer
 
-CMD_READ, CMD_KEY, CMD_NONCE, CMD_DATA = 0, 1, 2, 3
-STROBE, START, BLOCK_GO = 1 << 2, 1 << 3, 1 << 4
-IN_READY, BUSY, OUT_VALID = 5, 6, 7
+IV64 = 0x00001000808C0001
+LAP_GO, PERM_AFTER, PERM_12 = 1 << 5, 1 << 6, 1 << 7
 
-# (adlen, ptlen, ciphertext_hex, tag_hex); key = nonce = 00 01 .. 0f,
-# ad = 00 01 .. (adlen-1), pt = 00 01 .. (ptlen-1) -- NIST KAT pattern
 KATS = [
     (0, 0, "", "4427d64b8e1e1451fc445960f0839bb0"),
     (0, 1, "e7", "9f58f1f541fc51b5d438f8e1dd03f147"),
@@ -24,60 +22,82 @@ KATS = [
     (5, 40, "1f820273c65246b76d4ff8d1add72d5cc1703338b98ce4b34b5af9ce46120201bab2ef3cfb06ca33", "da6f8eefef6212cebc840a2186808900"),
 ]
 
-
-async def pulse(dut, bit, cmd, data=0):
-    """Rising edge on a control bit with CMD/data held (inputs are registered)."""
-    dut.ui_in.value = data
-    dut.uio_in.value = cmd
-    await ClockCycles(dut.clk, 1)
-    dut.uio_in.value = cmd | bit
-    await ClockCycles(dut.clk, 2)
-    dut.uio_in.value = cmd
-    await ClockCycles(dut.clk, 2)
+le64 = lambda b: int.from_bytes(b, "little")
 
 
-async def wait_bit(dut, bit, val, limit=20000):
+async def wait_ready(dut, limit=4000):
+    """Settle mid-cycle (falling edge) and return in a writable phase with
+    READY high; writes made now are seen by the next rising edge."""
     for _ in range(limit):
-        if (int(dut.uio_out.value) >> bit) & 1 == val:
+        await FallingEdge(dut.clk)
+        await ReadOnly()
+        ready = (int(dut.uio_out.value) >> 7) & 1
+        await Timer(1, units="ns")   # into the cycle interior: writable, before the next rising edge
+        if ready:
             return
-        await ClockCycles(dut.clk, 1)
-    raise AssertionError(f"timeout waiting for uio[{bit}] == {val}")
+    raise AssertionError("timeout waiting for READY")
 
 
-async def send_block(dut, data, is_ad, last):
-    await wait_bit(dut, IN_READY, 1)
-    for b in data:
-        await pulse(dut, STROBE, CMD_DATA, b)
-    await pulse(dut, BLOCK_GO, CMD_READ, (1 if is_ad else 0) | (2 if last else 0))
+async def lap(dut, planes, xor_mode, perm_after, perm12, capture=False):
+    """planes = (c0..c4) 64-bit column planes; returns 64 captured columns."""
+    await wait_ready(dut)
+    dut.uio_in.value = 1 if xor_mode else 0
+    dut.ui_in.value = LAP_GO | (PERM_AFTER if perm_after else 0) | (PERM_12 if perm12 else 0)
+    cap = []
+    for k in range(64):
+        await FallingEdge(dut.clk)      # lap cycle k, mid-cycle
+        col = 0
+        for w in range(5):
+            col |= ((planes[w] >> k) & 1) << w
+        dut.ui_in.value = col           # GO dropped from cycle 0 on
+        await ReadOnly()                # comb settled with this column
+        assert (int(dut.uo_out.value) >> 5) & 1, "LAP_ACTIVE dropped mid-lap"
+        if capture:
+            cap.append(int(dut.uo_out.value) & 0x1F)
+        await NextTimeStep()
+    return cap
 
 
-async def read_bytes(dut, n):
-    out = bytearray()
-    for _ in range(n):
-        await wait_bit(dut, OUT_VALID, 1)
-        out.append(int(dut.uo_out.value))
-        await pulse(dut, STROBE, CMD_READ)
-    return bytes(out)
+def blocks(data, with_empty):
+    out, i, n = [], 0, len(data)
+    while n - i >= 16:
+        out.append((le64(data[i:i + 8]), le64(data[i + 8:i + 16])))
+        i += 16
+    rem = n - i
+    if rem > 0 or (n == 0 and with_empty) or (n > 0 and rem == 0):
+        buf = bytearray(16)
+        buf[:rem] = data[i:]
+        buf[rem] = 0x01
+        out.append((le64(bytes(buf[:8])), le64(bytes(buf[8:]))))
+    return out
+
+
+def words_to_bytes(w0, w1):
+    return w0.to_bytes(8, "little") + w1.to_bytes(8, "little")
 
 
 async def encrypt(dut, key, nonce, ad, pt):
-    for b in key:
-        await pulse(dut, STROBE, CMD_KEY, b)
-    for b in nonce:
-        await pulse(dut, STROBE, CMD_NONCE, b)
-    await pulse(dut, START, CMD_READ, 0)          # ui_in[0] = DECRYPT = 0
-    for off in range(0, len(ad), 16):
-        blk = ad[off:off + 16]
-        await send_block(dut, blk, True, off + len(blk) == len(ad))
-    if len(pt) == 0:
-        await send_block(dut, b"", False, True)
-    for off in range(0, len(pt), 16):
-        blk = pt[off:off + 16]
-        await send_block(dut, blk, False, off + len(blk) == len(pt))
-    ct = await read_bytes(dut, len(pt))
-    tag = await read_bytes(dut, 16)
-    await wait_bit(dut, BUSY, 0)
-    return ct, tag
+    K0, K1 = le64(key[:8]), le64(key[8:])
+    N0, N1 = le64(nonce[:8]), le64(nonce[8:])
+    await lap(dut, (IV64, K0, K1, N0, N1), False, True, True)
+    await lap(dut, (0, 0, 0, K0, K1), True, False, False)
+    for b0, b1 in blocks(ad, False):
+        await lap(dut, (b0, b1, 0, 0, 0), True, True, False)
+    await lap(dut, (0, 0, 0, 0, 1 << 63), True, False, False)
+    pb = blocks(pt, True)
+    ct = b""
+    for i, (b0, b1) in enumerate(pb):
+        last = i == len(pb) - 1
+        cap = await lap(dut, (b0, b1, 0, 0, 0), True, not last, False, capture=True)
+        c0 = sum(((cap[k] >> 0) & 1) << k for k in range(64))
+        c1 = sum(((cap[k] >> 1) & 1) << k for k in range(64))
+        nb = min(16, max(0, len(pt) - 16 * i))
+        ct += words_to_bytes(c0, c1)[:nb]
+    await lap(dut, (0, 0, K0, K1, 0), True, True, True)
+    cap = await lap(dut, (0, 0, 0, K0, K1), True, False, False, capture=True)
+    t0 = sum(((cap[k] >> 3) & 1) << k for k in range(64))
+    t1 = sum(((cap[k] >> 4) & 1) << k for k in range(64))
+    return ct, words_to_bytes(t0, t1)
 
 
 @cocotb.test()
@@ -85,7 +105,6 @@ async def test_ascon_kats(dut):
     dut._log.info("Start")
     clock = Clock(dut.clk, 20, units="ns")
     cocotb.start_soon(clock.start())
-
     dut.ena.value = 1
     dut.ui_in.value = 0
     dut.uio_in.value = 0
@@ -94,7 +113,7 @@ async def test_ascon_kats(dut):
     dut.rst_n.value = 1
     await ClockCycles(dut.clk, 2)
 
-    assert int(dut.uio_oe.value) == 0xE0, "uio_oe must be 1110_0000"
+    assert int(dut.uio_oe.value) == 0x80, "uio_oe must be 1000_0000"
 
     key = bytes(range(16))
     nonce = bytes(range(16))
@@ -103,5 +122,5 @@ async def test_ascon_kats(dut):
         pt = bytes(i & 0xFF for i in range(ptlen))
         ct, tag = await encrypt(dut, key, nonce, ad, pt)
         dut._log.info(f"adlen={adlen} ptlen={ptlen} tag={tag.hex()}")
-        assert ct.hex() == ct_hex, f"ciphertext mismatch adlen={adlen} ptlen={ptlen}"
+        assert ct.hex() == ct_hex, f"ct mismatch adlen={adlen} ptlen={ptlen}"
         assert tag.hex() == tag_hex, f"tag mismatch adlen={adlen} ptlen={ptlen}"

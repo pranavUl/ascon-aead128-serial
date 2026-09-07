@@ -1,7 +1,20 @@
-/* Tiny Tapeout wrapper for the bit-serial
- * Ascon-AEAD128 core. Marshals the core's wide ports over TT's 8-in / 8-out /
- * 8-bidir pins with a byte-wide command bus.
+/*
+ * tt_um_pranavUl_ascon_aead128 -- streaming lap interface to the bit-serial
+ * Ascon permutation. No data buffers on chip: the host supplies one 5-bit
+ * column per cycle during a "lap" (64 cycles) and reads result columns live.
+ *
+ * ui[4:0]  COL_IN      column bits for the current lap cycle
+ * ui[5]    LAP_GO      request a lap (hold until LAP_ACTIVE rises)
+ * ui[6]    PERM_AFTER  start the permutation when this lap ends
+ * ui[7]    PERM_12     1 = 12 rounds, 0 = 8 rounds
+ * uio[0]   LAP_XOR     1 = XOR lap, 0 = RAW load lap
+ * uo[4:0]  COL_OUT     write-back column = state ^ COL_IN (XOR) or COL_IN (RAW)
+ * uo[5]    LAP_ACTIVE  a lap is running (cycle 0..63)
+ * uo[6]    PERM_BUSY
+ * uo[7]    PERM_DONE
+ * uio[7]   READY       state aligned at column 63, idle: LAP_GO honored now
  */
+ 
 `default_nettype none
 module tt_um_pranavUl_ascon_aead128 (
     input  wire [7:0] ui_in,
@@ -15,138 +28,77 @@ module tt_um_pranavUl_ascon_aead128 (
 );
     wire reset = ~rst_n;
 
-    // ---- input register + edge detect (host may be slow/async) ----
-    reg [7:0] ui_q;
-    reg [4:0] uio_q;    // uio[7:5] are outputs, never sampled
-    reg [4:2] uio_qq;   // only the edge-detected bits
-    always @(posedge clk) begin
-        if (reset) begin
-            ui_q   <= 8'h00;
-            uio_q  <= 5'b00000;
-            uio_qq <= 3'b000;
-        end else begin
-            ui_q   <= ui_in;
-            uio_q  <= uio_in[4:0];
-            uio_qq <= uio_q[4:2];
-        end
-    end
-    wire [1:0] cmd      = uio_q[1:0];
-    wire       strobe_e = uio_q[2] & ~uio_qq[2];
-    wire       start_e  = uio_q[3] & ~uio_qq[3];
-    wire       go_e     = uio_q[4] & ~uio_qq[4];
+    wire [4:0] col_in     = ui_in[4:0];
+    wire       lap_go     = ui_in[5];
+    wire       perm_after = ui_in[6];
+    wire       perm_12    = ui_in[7];
+    wire       lap_xor    = uio_in[0];
 
-    // ---- host-facing registers ----
-    reg [127:0] key_r, nonce_r;
-    reg [127:0] bdi_r;
-    reg [4:0]   bdi_cnt;
-    reg         bdi_valid_r;
-    reg [4:0]   bdi_bytes_r;
-    reg         bdi_ad_r, bdi_last_r;
-    reg         start_r, dec_r;
-    reg [127:0] out_r;
-    reg [4:0]   out_cnt;
-    reg         tag_taken;
+    reg        lap_run_q;
+    reg  [5:0] lap_cnt_q;
+    reg        go_perm_q, rounds12_q, xor_q;
+    reg  [5:0] pos_q;
+    reg        p_start;
 
-    // ---- core signals ----
-    wire         core_bdi_ready;
-    wire         core_bdo_valid;
-    wire [127:0] core_bdo;
-    wire [4:0]   core_bdo_bytes;
-    wire         core_tag_valid;
-    wire [127:0] core_tag;
-    wire         core_busy;
+    wire [4:0] p_bits_out;
+    wire       perm_busy, perm_done;
 
-    wire out_empty = (out_cnt == 5'd0);
+    wire lap_begin = lap_go && !lap_run_q && !perm_busy && !p_start && (pos_q == 6'd63);
+    wire lap_last  = lap_run_q && (lap_cnt_q == 6'd63);
+    wire [4:0] p_bits_in = xor_q ? (p_bits_out ^ col_in) : col_in;
 
     always @(posedge clk) begin
         if (reset) begin
-            key_r       <= 128'd0;
-            nonce_r     <= 128'd0;
-            bdi_r       <= 128'd0;
-            bdi_cnt     <= 5'd0;
-            bdi_valid_r <= 1'b0;
-            bdi_bytes_r <= 5'd0;
-            bdi_ad_r    <= 1'b0;
-            bdi_last_r  <= 1'b0;
-            start_r     <= 1'b0;
-            dec_r       <= 1'b0;
-            out_r       <= 128'd0;
-            out_cnt     <= 5'd0;
-            tag_taken   <= 1'b0;
+            lap_run_q  <= 1'b0;
+            lap_cnt_q  <= 6'd0;
+            pos_q      <= 6'd0;
+            p_start    <= 1'b0;
+            go_perm_q  <= 1'b0;
+            rounds12_q <= 1'b0;
+            xor_q      <= 1'b0;
         end else begin
-            start_r <= 1'b0;
+            p_start <= 1'b0;
 
-            // key / nonce: shift in from the top, 16 bytes each, byte 0 first
-            if (strobe_e && cmd == 2'b01) key_r   <= {ui_q, key_r[127:8]};
-            if (strobe_e && cmd == 2'b10) nonce_r <= {ui_q, nonce_r[127:8]};
+            // head position of the idle-rotating state (same as the core)
+            if (perm_done)
+                pos_q <= 6'd1;
+            else if (!perm_busy && !lap_run_q)
+                pos_q <= pos_q + 6'd1;
+            else
+                pos_q <= 6'd0;
 
-            // data staging: byte-addressed, 0..16 bytes
-            if (strobe_e && cmd == 2'b11 && !bdi_valid_r && bdi_cnt != 5'd16) begin
-                bdi_r[{bdi_cnt[3:0], 3'b000} +: 8] <= ui_q;
-                bdi_cnt <= bdi_cnt + 5'd1;
-            end
-
-            // hand the staged block to the core
-            if (go_e && !bdi_valid_r) begin
-                bdi_valid_r <= 1'b1;
-                bdi_bytes_r <= bdi_cnt;
-                bdi_ad_r    <= ui_q[0];
-                bdi_last_r  <= ui_q[1];
-            end
-            if (bdi_valid_r && core_bdi_ready) begin
-                bdi_valid_r <= 1'b0;
-                bdi_r       <= 128'd0;   // unused bytes must be zero for padding
-                bdi_cnt     <= 5'd0;
-            end
-
-            if (start_e) begin
-                start_r <= 1'b1;
-                dec_r   <= ui_q[0];
-            end
-
-            // output FIFO: pop on read, else capture BDO or TAG when empty
-            if (strobe_e && cmd == 2'b00 && !out_empty) begin
-                out_r   <= {8'h00, out_r[127:8]};
-                out_cnt <= out_cnt - 5'd1;
-            end else if (out_empty) begin
-                if (core_bdo_valid) begin
-                    out_r   <= core_bdo;
-                    out_cnt <= core_bdo_bytes;
-                end else if (core_tag_valid && !tag_taken) begin
-                    out_r     <= core_tag;
-                    out_cnt   <= 5'd16;
-                    tag_taken <= 1'b1;
+            if (lap_begin) begin
+                lap_run_q  <= 1'b1;
+                lap_cnt_q  <= 6'd0;
+                go_perm_q  <= perm_after;
+                rounds12_q <= perm_12;
+                xor_q      <= lap_xor;
+            end else if (lap_run_q) begin
+                lap_cnt_q <= lap_cnt_q + 6'd1;
+                if (lap_last) begin
+                    lap_run_q <= 1'b0;
+                    if (go_perm_q) p_start <= 1'b1;
                 end
             end
-            if (!core_tag_valid) tag_taken <= 1'b0;
         end
     end
 
-    ascon_core_serial u_core (
-        .clk         (clk),
-        .reset       (reset),
-        .START       (start_r),
-        .DECRYPT     (dec_r),
-        .KEY         (key_r),
-        .NONCE       (nonce_r),
-        .BDI_VALID   (bdi_valid_r),
-        .BDI_READY   (core_bdi_ready),
-        .BDI         (bdi_r),
-        .BDI_BYTES   (bdi_bytes_r),
-        .BDI_TYPE_AD (bdi_ad_r),
-        .BDI_LAST    (bdi_last_r),
-        .BDO_VALID   (core_bdo_valid),
-        .BDO_READY   (out_empty),
-        .BDO         (core_bdo),
-        .BDO_BYTES   (core_bdo_bytes),
-        .TAG_VALID   (core_tag_valid),
-        .TAG         (core_tag),
-        .BUSY        (core_busy)
+    ascon_permutation_serial u_perm (
+        .clk           (clk),
+        .reset         (reset),
+        .LOAD_EN       (lap_run_q),
+        .BITS_IN       (p_bits_in),
+        .START         (p_start),
+        .NUM_ROUNDS_12 (rounds12_q),
+        .BUSY          (perm_busy),
+        .DONE          (perm_done),
+        .UNLOAD_EN     (1'b0),
+        .BITS_OUT      (p_bits_out)
     );
 
-    assign uo_out  = out_r[7:0];
-    assign uio_out = {~out_empty, core_busy, ~bdi_valid_r, 5'b00000};
-    assign uio_oe  = 8'b1110_0000;
+    assign uo_out  = {perm_done, perm_busy, lap_run_q, p_bits_in};
+    assign uio_out = {(pos_q == 6'd63) && !perm_busy && !lap_run_q && !p_start, 7'b0000000};
+    assign uio_oe  = 8'b1000_0000;
 
-    wire _unused = &{ena, uio_in[7:5], 1'b0};
+    wire _unused = &{ena, uio_in[7:1], 1'b0};
 endmodule
