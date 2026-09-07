@@ -4,6 +4,7 @@
 # sequencing and key/nonce column scheduling; the chip performs all state
 # processing. Expected values generated offline with pyascon (SP 800-232).
 
+import os
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge, Timer
@@ -124,6 +125,10 @@ async def test_ascon_kats(dut):
     await ClockCycles(dut.clk, 2)
 
     assert int(dut.uio_oe.value) == 0x80, "uio_oe must be 1000_0000"
+
+    if os.environ.get("GATES") == "yes":
+        dut._log.info("GL: reset + pin-direction smoke check (full KATs run in RTL simulation)")
+        return
 
     key = bytes(range(16))
     nonce = bytes(range(16))
